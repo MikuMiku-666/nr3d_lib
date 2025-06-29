@@ -46,6 +46,9 @@ static constexpr uint32_t MAX_N_LEVELS = 24;
 static constexpr uint32_t N_THREADS = 128;
 static constexpr uint32_t N_THREADS_BACK = 128;
 
+torch::Tensor random_rotation_in_zero_sum_subspace_cuda(int dim, int num, torch::Device device, torch::Dtype dtype);
+
+
 struct PermutoEncMetaRef { // GPU Reference structure for PermutoEncMeta
 	// Do not exceeds 4096 Bytes of constant memory
 	float level_scales0[MAX_N_LEVELS];	        // [n_levels]	Original raw positions scales per `level`
@@ -84,6 +87,113 @@ struct PermutoEncMetaRef { // GPU Reference structure for PermutoEncMeta
 		}
 	}
 };
+
+#include <curand_kernel.h>
+#include <math_constants.h>
+
+__device__ float dot(const float* a, const float* b, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) s += a[i] * b[i];
+    return s;
+}
+
+__device__ float norm(const float* a, int n) {
+    return sqrtf(dot(a, a, n) + 1e-12f);
+}
+
+// 在零和子空间内生成随机旋转矩阵
+// 输出 R_out，大�度为 (dim+1)*(dim+1)
+// state 用于产生随机数
+__device__ void generate_random_rotation_in_zero_sum_subspace(
+    float* R_out,
+    int dim,
+    curandState* state
+) {
+    const int N = dim + 1;
+    // 1) 构造投影矩阵 M = I - (1/N)·1·1^T，取其前 dim 列作为原始基 Q_raw
+    //    并在 Q_sub 中做 Gram–Schmidt，得到正交基 Q_sub (N x dim)
+    float Q_raw[ /*max  (dim+1)*dim */ 128 ];
+    float Q_sub[ /*max  (dim+1)*dim */ 128 ];
+
+    // 填充 Q_raw = M 的前 dim 列
+    float invN = 1.0f / float(N);
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < dim; ++j) {
+            // M[i][j] = (i==j ? 1 : 0) - 1/N
+            Q_raw[i*dim + j] = ((i == j) ? 1.0f : 0.0f) - invN;
+        }
+    }
+    // GS 正交化
+    for (int j = 0; j < dim; ++j) {
+        // v = Q_raw[:,j]
+        float* v = Q_sub + j; // 临时存放在 Q_sub 的第 j 列
+        for (int i = 0; i < N; ++i) v[i*dim] = Q_raw[i*dim + j];
+        // 减去在已有基上的投影
+        for (int k = 0; k < j; ++k) {
+            float dot_vq = 0.0f;
+            float* qk = Q_sub + k;
+            for (int i = 0; i < N; ++i) dot_vq += v[i*dim] * qk[i*dim];
+            for (int i = 0; i < N; ++i) v[i*dim] -= dot_vq * qk[i*dim];
+        }
+        // 归一化
+        float vnorm = norm(v, N);
+        for (int i = 0; i < N; ++i) v[i*dim] /= vnorm;
+    }
+    // 此时 Q_sub 中存放了 N x dim 的正交基，列优先：Q_sub[i*dim + j] 表示第 i 行第 j 列
+
+    // 2) 在子空间中生成随机正交矩阵 R_sub (dim x dim)
+    float R_sub[ /*max dim*dim */ 64 ];
+    // 用高斯随机填充
+    for (int i = 0; i < dim*dim; ++i) {
+        R_sub[i] = curand_normal(state);
+    }
+    // GS 正交化其列
+    for (int j = 0; j < dim; ++j) {
+        // v = R_sub[:,j]
+        for (int i = 0; i < dim; ++i) {
+            float* v = R_sub + j*dim + i; // R_sub[i][j]
+            // 投影到已有列 k 上
+            for (int k = 0; k < j; ++k) {
+                float dot_vk = 0.0f;
+                for (int t = 0; t < dim; ++t)
+                    dot_vk += R_sub[t*dim + j] * R_sub[t*dim + k];
+                for (int t = 0; t < dim; ++t)
+                    R_sub[t*dim + j] -= dot_vk * R_sub[t*dim + k];
+            }
+        }
+        // 归一化
+        float col_norm = 0.0f;
+        for (int i = 0; i < dim; ++i) col_norm += R_sub[i*dim + j] * R_sub[i*dim + j];
+        col_norm = sqrtf(col_norm) + 1e-12f;
+        for (int i = 0; i < dim; ++i) {
+            R_sub[i*dim + j] /= col_norm;
+        }
+    }
+
+    // 3) 合成最终旋转：R = Q_sub * R_sub * Q_sub^T
+    // 中间计算 T = Q_sub · R_sub  (N x dim)
+    float T[ /*max (dim+1)*dim */ 128 ];
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < dim; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < dim; ++k) {
+                s += Q_sub[i*dim + k] * R_sub[k*dim + j];
+            }
+            T[i*dim + j] = s;
+        }
+    }
+    // 最终 R_out = T · Q_sub^T  (N x N)
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) {
+            float s = 0.0f;
+            for (int k = 0; k < dim; ++k) {
+                s += T[i*dim + k] * Q_sub[j*dim + k];
+            }
+            R_out[i*N + j] = s;
+        }
+    }
+}
+
 
 
 template <typename T, uint32_t N_ELEMS>
@@ -135,6 +245,7 @@ kernel_permutohedral(
 	// Fixed inputs
 	const INPUT_T* __restrict__ level_scales_multidim, // [n_levels, N_POS_DIMS]
 	const INPUT_T* __restrict__ level_random_shifts, // [n_levels, N_POS_DIMS]
+	const INPUT_T* __restrict__ level_random_rotations, // [n_levels, N_POS_DIMS, N_POS_DIMS]
 	// Optional inputs
 	const int64_t* __restrict__ batch_inds,     // [n_points]
 	const int64_t* __restrict__ batch_offsets,  // [n_batch]
@@ -200,6 +311,13 @@ kernel_permutohedral(
 		}
 	}
 
+	/*lzy：创建本层级的随机旋转矩阵*/
+	COMPUTE_T random_shifts_cur_lvl[N_POS_DIMS + 1][N_POS_DIMS + 1]{0};
+	if(level_random_rotations){
+		random_rotations_cur_lvl = random_rotation_in_zero_sum_subspace_cuda(N_POS_DIMS, n_levels, device, dtype); /*只用写N_POS_DIMS,内部会加1*/
+	}
+        // register_buffer("level_random_rotations", level_random_rotations);
+
 	//---- Elevate d-dimension vector to (d+1)-dimension homogeneous vector on hyperplane H_d
 	// 1. `level_random_shifts` is to randomly shifts positions on different levels and different dims, 
 	//    to minimize collision
@@ -216,7 +334,8 @@ kernel_permutohedral(
 	}
 	elevated[0] = sm;
 
-
+	/*lzy：在这里要添加实际相乘操作 */
+	//  elecated = elevated * random_rotations_cur_lvl;  // 矩阵乘法
 
 	//---- Find the closest remainder-0 point through rounding
 	int32_t rem0[N_POS_DIMS+1]; // The coords of remainder-0 point
@@ -345,6 +464,8 @@ kernel_permutohedral_backward_lattice(
 	// Fixed inputs
 	const INPUT_T* __restrict__ level_scales_multidim, // [n_levels, N_POS_DIMS]
 	const INPUT_T* __restrict__ level_random_shifts, // [n_levels, N_POS_DIMS]
+	const INPUT_T* __restrict__ level_random_rotations, // [n_levels, N_POS_DIMS]
+
 	// Stored data
 	// const int32_t* __restrict__ rank_,          // [n_points, N_POS_DIMS+1] Optional extra stored rank
 	// const int32_t* __restrict__ rem0_,          // [n_points, N_POS_DIMS+1] Optional extra stored remainder-0 point coords
@@ -409,6 +530,13 @@ kernel_permutohedral_backward_lattice(
 		for (uint32_t dim=0; dim<N_POS_DIMS; ++dim) {
 			random_shifts_cur_lvl[dim] = level_random_shifts[level * N_POS_DIMS + dim]; 
 		}
+	}
+
+	COMPUTE_T random_rotations_cur_lvl[N_POS_DIMS + 1][N_POS_DIMS + 1]{0};
+	if (level_random_rotations) {
+		#pragma unroll
+		random_rotations_cur_lvl = random_rotation_in_zero_sum_subspace_cuda(N_POS_DIMS, n_levels, device, dtype);
+		/*lzy：获取旋转矩阵 */
 	}
 
 	//---- Offset `dL_dy` to the current point index and out_feat_offset
@@ -629,6 +757,13 @@ kernel_permutohedral_backward_input(
 		}
 	}
 
+	COMPUTE_T random_rotations_cur_lvl[N_POS_DIMS + 1][N_POS_DIMS + 1]{0};
+	if (level_random_rotations) {
+		#pragma unroll
+		random_rotations_cur_lvl = random_rotation_in_zero_sum_subspace_cuda(N_POS_DIMS, n_levels, device, dtype);
+		/*lzy：获取旋转矩阵 */
+	}
+
 	//---- Offset `dL_dy` to the current point index and out_feat_offset
 	dL_dy += i * meta.n_encoded_dims + out_feat_offset;
 	vector_t<COMPUTE_T, N_FEAT_PER_THREAD> dL_dy_i;
@@ -655,6 +790,8 @@ kernel_permutohedral_backward_input(
 	}
 	elevated[0] = sm;
 
+	/*lzy: 矩阵乘法*/
+	// elevated = elevated * random_rotations_cur_lvl;  // 矩阵乘法
 
 
 	//---- Find the closest remainder-0 point through rounding
@@ -852,6 +989,13 @@ kernel_permutohedral_backward_backward_input(
 		}
 	}
 
+	COMPUTE_T random_rotations_cur_lvl[N_POS_DIMS + 1][N_POS_DIMS + 1]{0};
+	if (level_random_rotations) {
+		#pragma unroll
+		random_rotations_cur_lvl = random_rotation_in_zero_sum_subspace_cuda(N_POS_DIMS, n_levels, device, dtype);
+		/*lzy：获取旋转矩阵 */
+	}
+
 	//---- Offset `dL_dy` to the current point index and out_feat_offset
 	dL_dy += i * meta.n_encoded_dims + out_feat_offset;
 	vector_t<COMPUTE_T, N_FEAT_PER_THREAD> dL_dy_i;
@@ -884,7 +1028,8 @@ kernel_permutohedral_backward_backward_input(
 	}
 	elevated[0] = sm;
 
-
+	/*lzy: 矩阵乘法*/
+	// elevated = elevated * random_rotations_cur_lvl;  // 矩阵乘法
 
 	//---- Find the closest remainder-0 point through rounding
 	int32_t rem0[N_POS_DIMS+1]; // The coords of remainder-0 point
@@ -1037,6 +1182,7 @@ void permuto_enc_fwd_impl_dispatched(
 	at::Tensor& lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_,
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	uint32_t batch_data_size, 
@@ -1060,6 +1206,7 @@ void permuto_enc_fwd_impl_dispatched(
 		data_ptr<PARAM_T>(lattice_values), 
 		level_scales_multidim.data_ptr<float>(), 
 		level_random_shifts_.has_value() ? data_ptr<float>(level_random_shifts_.value()) : nullptr, 
+		level_random_rotations_.has_value() ? data_ptr<float>(level_random_rotations_.value()) : nullptr, 
 		batch_inds_.has_value() ? batch_inds_.value().data_ptr<int64_t>() : nullptr, 
 		batch_offsets_.has_value() ? batch_offsets_.value().data_ptr<int64_t>() : nullptr, 
 		batch_data_size, 
@@ -1079,6 +1226,7 @@ void permuto_enc_fwd_impl_templated(
 	at::Tensor& lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_,
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	uint32_t batch_data_size, 
@@ -1090,9 +1238,9 @@ void permuto_enc_fwd_impl_templated(
 		throw std::runtime_error("PermutoEncImpl: Currently, do not support input type combination = <positions,lattice_values> -> (half,half)");
 		// permuto_enc_fwd_impl_dispatched<__half, __half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded);
 	} else if (positions.scalar_type() == at::kFloat && lattice_values.scalar_type() == at::kHalf) {
-		permuto_enc_fwd_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded);
+		permuto_enc_fwd_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded);
 	} else if (positions.scalar_type() == at::kFloat && lattice_values.scalar_type() == at::kFloat) {
-		permuto_enc_fwd_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded);
+		permuto_enc_fwd_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded);
 	} else {
 		throw std::runtime_error("PermutoEncImpl: Input type combination not supported. Supported types are: <positions,lattice_values> -> (half, half), (float, half), (float, float)");
 	}
@@ -1106,6 +1254,7 @@ void permuto_enc_fwd_impl(
 	at::Tensor& lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_,
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	uint32_t batch_data_size, 
@@ -1114,8 +1263,8 @@ void permuto_enc_fwd_impl(
 	at::Tensor& encoded
 ) {
 	switch (meta.n_feat_per_pseudo_lvl) {
-		case 2: permuto_enc_fwd_impl_templated<N_POS_DIMS,2>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 4: permuto_enc_fwd_impl_templated<N_POS_DIMS,4>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 2: permuto_enc_fwd_impl_templated<N_POS_DIMS,2>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 4: permuto_enc_fwd_impl_templated<N_POS_DIMS,4>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
 		// case 8: permuto_enc_fwd_impl_templated<N_POS_DIMS,8>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
 		default: throw std::runtime_error("PermutoEncImpl: `n_feat_per_pseudo_lvl` must be one of [2,4,8]"); break;
 	}
@@ -1131,6 +1280,7 @@ void permuto_enc_bwd_impl_dispatched(
 	at::Tensor& lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_,
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	uint32_t batch_data_size, 
@@ -1162,6 +1312,7 @@ void permuto_enc_bwd_impl_dispatched(
 			data_ptr<PARAM_T>(lattice_values), 
 			level_scales_multidim.data_ptr<float>(), 
 			level_random_shifts_.has_value() ? data_ptr<float>(level_random_shifts_.value()) : nullptr, 
+			level_random_rotations_.has_value() ? data_ptr<float>(level_random_rotations_.value()) : nullptr, 
 			batch_inds_.has_value() ? batch_inds_.value().data_ptr<int64_t>() : nullptr, 
 			batch_offsets_.has_value() ? batch_offsets_.value().data_ptr<int64_t>() : nullptr, 
 			batch_data_size, 
@@ -1179,6 +1330,7 @@ void permuto_enc_bwd_impl_dispatched(
 			data_ptr<PARAM_T>(lattice_values), 
 			level_scales_multidim.data_ptr<float>(), 
 			level_random_shifts_.has_value() ? data_ptr<float>(level_random_shifts_.value()) : nullptr, 
+			level_random_rotations_.has_value() ? data_ptr<float>(level_random_rotations_.value()) : nullptr, 
 			batch_inds_.has_value() ? batch_inds_.value().data_ptr<int64_t>() : nullptr, 
 			batch_offsets_.has_value() ? batch_offsets_.value().data_ptr<int64_t>() : nullptr, 
 			batch_data_size, 
@@ -1197,6 +1349,7 @@ void permuto_enc_bwd_impl_templated(
 	at::Tensor& lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_,
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	uint32_t batch_data_size, 
@@ -1212,9 +1365,9 @@ void permuto_enc_bwd_impl_templated(
 		throw std::runtime_error("PermutoEncImpl: Currently, do not support input type combination = <positions,lattice_values> -> (half,half)");
 		// permuto_enc_bwd_impl_dispatched<__half, __half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); 
 	} else if (positions.scalar_type() == at::kFloat && lattice_values.scalar_type() == at::kHalf) {
-		permuto_enc_bwd_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); 
+		permuto_enc_bwd_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); 
 	} else if (positions.scalar_type() == at::kFloat && lattice_values.scalar_type() == at::kFloat) {
-		permuto_enc_bwd_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); 
+		permuto_enc_bwd_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); 
 	} else {
 		throw std::runtime_error("PermutoEncImpl: Input type combination not supported. Supported types are: <positions,lattice_values> -> (half, half), (float, half), (float, float)");
 	}
@@ -1229,6 +1382,7 @@ void permuto_enc_bwd_impl(
 	at::Tensor& lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_,
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	uint32_t batch_data_size, 
@@ -1241,8 +1395,8 @@ void permuto_enc_bwd_impl(
 	at::Tensor& dL_dlattice_val
 ) {
 	switch (meta.n_feat_per_pseudo_lvl) {
-		case 2: permuto_enc_bwd_impl_templated<N_POS_DIMS,2>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 4: permuto_enc_bwd_impl_templated<N_POS_DIMS,4>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 2: permuto_enc_bwd_impl_templated<N_POS_DIMS,2>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 4: permuto_enc_bwd_impl_templated<N_POS_DIMS,4>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
 		// case 8: permuto_enc_bwd_impl_templated<N_POS_DIMS,8>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
 		default: throw std::runtime_error("PermutoEncImpl: `n_feat_per_pseudo_lvl` must be one of [2,4,8]"); break;
 	}
@@ -1258,6 +1412,7 @@ void permuto_enc_bwd_bwd_input_impl_dispatched(
 	at::Tensor& lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_,
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	uint32_t batch_data_size, 
@@ -1287,6 +1442,7 @@ void permuto_enc_bwd_bwd_input_impl_dispatched(
 		data_ptr<PARAM_T>(lattice_values), 
 		level_scales_multidim.data_ptr<float>(), 
 		level_random_shifts_.has_value() ? data_ptr<float>(level_random_shifts_.value()) : nullptr, 
+		level_random_rotations_.has_value() ? data_ptr<float>(level_random_rotations_.value()) : nullptr, 
 		batch_inds_.has_value() ? batch_inds_.value().data_ptr<int64_t>() : nullptr, 
 		batch_offsets_.has_value() ? batch_offsets_.value().data_ptr<int64_t>() : nullptr, 
 		batch_data_size, 
@@ -1306,6 +1462,7 @@ void permuto_enc_bwd_bwd_input_impl_templated(
 	at::Tensor& lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_,
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	uint32_t batch_data_size, 
@@ -1320,9 +1477,9 @@ void permuto_enc_bwd_bwd_input_impl_templated(
 		throw std::runtime_error("PermutoEncImpl: Currently, do not support input type combination = <positions,lattice_values> -> (half,half)");
 		// permuto_enc_bwd_bwd_input_impl_dispatched<__half, __half, __half, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); 
 	} else if (positions.scalar_type() == at::kFloat && lattice_values.scalar_type() == at::kHalf) {
-		permuto_enc_bwd_bwd_input_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); 
+		permuto_enc_bwd_bwd_input_impl_dispatched<float, __half, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); 
 	} else if (positions.scalar_type() == at::kFloat && lattice_values.scalar_type() == at::kFloat) {
-		permuto_enc_bwd_bwd_input_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); 
+		permuto_enc_bwd_bwd_input_impl_dispatched<float, float, float, N_POS_DIMS, N_FEAT_PER_PSEUDO_LVL>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); 
 	} else {
 		throw std::runtime_error("PermutoEncImpl: Input type combination not supported. Supported types are: <positions,lattice_values> -> (half, half), (float, half), (float, float)");
 	}
@@ -1338,6 +1495,7 @@ void permuto_enc_bwd_bwd_input_impl(
 	at::Tensor& lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_,
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	uint32_t batch_data_size, 
@@ -1349,8 +1507,8 @@ void permuto_enc_bwd_bwd_input_impl(
 	at::Tensor& dL_dlattice_val
 ) {
 	switch (meta.n_feat_per_pseudo_lvl) {
-		case 2: permuto_enc_bwd_bwd_input_impl_templated<N_POS_DIMS,2>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 4: permuto_enc_bwd_bwd_input_impl_templated<N_POS_DIMS,4>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 2: permuto_enc_bwd_bwd_input_impl_templated<N_POS_DIMS,2>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 4: permuto_enc_bwd_bwd_input_impl_templated<N_POS_DIMS,4>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
 		// case 8: permuto_enc_bwd_bwd_input_impl_templated<N_POS_DIMS,8>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
 		default: throw std::runtime_error("PermutoEncImpl: `n_feat_per_pseudo_lvl` must be one of [2,4,8]"); break;
 	}

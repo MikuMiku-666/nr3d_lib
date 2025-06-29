@@ -41,6 +41,29 @@ Citation:
 
 namespace permuto {
 
+// 生成零和子空间的随机旋转矩阵
+torch::Tensor random_rotation_in_zero_sum_subspace_cuda(int dim, int num, torch::Device device, torch::Dtype dtype) {
+    // 创建单位矩阵
+    torch::Tensor I = torch::eye(dim + 1, device=device, dtype=dtype);
+    torch::Tensor ones = torch::ones({dim + 1, 1}, device=device, dtype=dtype);
+    auto Q = torch::linalg::qr(I - torch::matmul(ones, ones.transpose(0, 1)) / (dim + 1)).Q;  // QR分解
+    Q = Q.slice(1, 0, -1); // [dim+1, dim]
+
+    // 生成 num 个随机旋转矩阵
+    torch::Tensor R_sub = torch::randn({num, dim, dim}, device=device, dtype=dtype);  // 随机矩阵
+    for (int i = 0; i < num; ++i) {
+        auto R = torch::linalg::qr(R_sub[i]).Q; // QR 分解确保正交性
+        R_sub[i] = R; // 存储旋转矩阵
+    }
+
+    // 批量旋转矩阵乘法：Q @ R @ Q.T
+    auto Q_T = Q.transpose(0, 1).unsqueeze(0).expand(num, -1, -1); // [num, dim, dim+1]
+    auto Q_exp = Q.unsqueeze(0).expand(num, -1, -1); // [num, dim+1, dim]
+
+    // 执行旋转操作
+    return torch::matmul(Q_exp, torch::matmul(R_sub, Q_T));  // 返回旋转后的矩阵
+}
+
 const std::vector<uint32_t> supported_n_input_dims{2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,24,28,32,36,40,48,56,64}; 
 
 void PermutoEncMeta::create_meta(
@@ -161,10 +184,11 @@ at::Tensor permuto_enc_fwd(
 	at::Tensor lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_, 
+	at::optional<at::Tensor> level_random_rotations_,
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	at::optional<uint32_t> batch_data_size_, 
-	at::optional<int32_t> max_level_
+	at::optional<int32_t> max_level_ 
 ) {	
 	at::TensorArg positions_arg(positions, "positions", 1); 
 	at::TensorArg lattice_values_arg(lattice_values, "lattice_values", 2);
@@ -193,6 +217,16 @@ at::Tensor permuto_enc_fwd(
 		at::checkSameGPU(__func__, positions_arg, level_random_shifts_arg);
 		at::checkContiguous(__func__, level_random_shifts_arg);
 	}
+
+	at::Tensor level_random_rotations;
+	at::TensorArg level_random_rotations_arg(level_random_rotations, "level_random_rotations", 3);
+	if (level_random_rotations_.has_value()) {
+		level_random_rotations = level_random_rotations_.value().to(at::kFloat);
+		at::checkSize(__func__, level_random_rotations_arg, {meta.n_levels, meta.n_dims_to_encode});
+		at::checkSameGPU(__func__, positions_arg, level_random_rotations_arg);
+		at::checkContiguous(__func__, level_random_rotations_arg);
+	}
+
 
 	at::Tensor batch_inds;
 	at::TensorArg batch_inds_arg(batch_inds, "batch_inds", 4);
@@ -229,33 +263,33 @@ at::Tensor permuto_enc_fwd(
 	}
 	
 	switch (meta.n_dims_to_encode) {
-		case 2:  permuto_enc_fwd_impl< 2>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 3:  permuto_enc_fwd_impl< 3>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 4:  permuto_enc_fwd_impl< 4>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 5:  permuto_enc_fwd_impl< 5>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 6:  permuto_enc_fwd_impl< 6>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 7:  permuto_enc_fwd_impl< 7>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 8:  permuto_enc_fwd_impl< 8>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 9:  permuto_enc_fwd_impl< 9>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 10: permuto_enc_fwd_impl<10>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 11: permuto_enc_fwd_impl<11>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 12: permuto_enc_fwd_impl<12>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 13: permuto_enc_fwd_impl<13>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 14: permuto_enc_fwd_impl<14>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 15: permuto_enc_fwd_impl<15>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 16: permuto_enc_fwd_impl<16>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 17: permuto_enc_fwd_impl<17>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 18: permuto_enc_fwd_impl<18>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 19: permuto_enc_fwd_impl<19>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 20: permuto_enc_fwd_impl<20>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 24: permuto_enc_fwd_impl<24>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 28: permuto_enc_fwd_impl<28>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 32: permuto_enc_fwd_impl<32>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 36: permuto_enc_fwd_impl<36>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 40: permuto_enc_fwd_impl<40>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 48: permuto_enc_fwd_impl<48>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 56: permuto_enc_fwd_impl<56>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
-		case 64: permuto_enc_fwd_impl<64>(meta, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 2:  permuto_enc_fwd_impl< 2>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 3:  permuto_enc_fwd_impl< 3>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 4:  permuto_enc_fwd_impl< 4>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 5:  permuto_enc_fwd_impl< 5>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 6:  permuto_enc_fwd_impl< 6>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 7:  permuto_enc_fwd_impl< 7>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 8:  permuto_enc_fwd_impl< 8>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 9:  permuto_enc_fwd_impl< 9>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 10: permuto_enc_fwd_impl<10>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 11: permuto_enc_fwd_impl<11>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 12: permuto_enc_fwd_impl<12>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 13: permuto_enc_fwd_impl<13>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 14: permuto_enc_fwd_impl<14>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 15: permuto_enc_fwd_impl<15>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 16: permuto_enc_fwd_impl<16>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 17: permuto_enc_fwd_impl<17>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 18: permuto_enc_fwd_impl<18>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 19: permuto_enc_fwd_impl<19>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_,batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 20: permuto_enc_fwd_impl<20>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 24: permuto_enc_fwd_impl<24>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 28: permuto_enc_fwd_impl<28>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 32: permuto_enc_fwd_impl<32>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 36: permuto_enc_fwd_impl<36>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 40: permuto_enc_fwd_impl<40>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 48: permuto_enc_fwd_impl<48>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 56: permuto_enc_fwd_impl<56>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
+		case 64: permuto_enc_fwd_impl<64>(meta, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, encoded); break;
 		default: throw std::runtime_error(std::string("PermutoEncImpl::fwd: `n_dims_to_encode`=") + std::to_string(meta.n_dims_to_encode) + std::string(" is not yet implemented.")); break;
 	}
 
@@ -270,6 +304,7 @@ std::tuple<at::Tensor, at::Tensor> permuto_enc_bwd(
 	at::Tensor lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_, 
+	at::optional<at::Tensor> level_random_rotations_, 
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	at::optional<uint32_t> batch_data_size_, 
@@ -311,6 +346,15 @@ std::tuple<at::Tensor, at::Tensor> permuto_enc_bwd(
 		at::checkSameGPU(__func__, positions_arg, level_random_shifts_arg);
 		at::checkSameType(__func__, positions_arg, level_random_shifts_arg);
 		at::checkContiguous(__func__, level_random_shifts_arg);
+	}
+
+	at::Tensor level_random_rotations;
+	at::TensorArg level_random_rotations_arg(level_random_rotations, "level_random_rotations", 4);
+	if (level_random_rotations_.has_value()) {
+		level_random_rotations = level_random_rotations_.value().to(at::kFloat);
+		at::checkSize(__func__, level_random_rotations_arg, {meta.n_levels, meta.n_dims_to_encode});
+		at::checkSameGPU(__func__, positions_arg, level_random_rotations_arg);
+		at::checkContiguous(__func__, level_random_rotations_arg);
 	}
 
 	at::Tensor batch_inds;
@@ -358,33 +402,33 @@ std::tuple<at::Tensor, at::Tensor> permuto_enc_bwd(
 	}
 
 	switch (meta.n_dims_to_encode) {
-		case 2:  permuto_enc_bwd_impl< 2>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 3:  permuto_enc_bwd_impl< 3>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 4:  permuto_enc_bwd_impl< 4>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 5:  permuto_enc_bwd_impl< 5>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 6:  permuto_enc_bwd_impl< 6>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 7:  permuto_enc_bwd_impl< 7>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 8:  permuto_enc_bwd_impl< 8>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 9:  permuto_enc_bwd_impl< 9>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 10: permuto_enc_bwd_impl<10>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 11: permuto_enc_bwd_impl<11>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 12: permuto_enc_bwd_impl<12>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 13: permuto_enc_bwd_impl<13>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 14: permuto_enc_bwd_impl<14>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 15: permuto_enc_bwd_impl<15>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 16: permuto_enc_bwd_impl<16>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 17: permuto_enc_bwd_impl<17>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 18: permuto_enc_bwd_impl<18>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 19: permuto_enc_bwd_impl<19>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 20: permuto_enc_bwd_impl<20>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 24: permuto_enc_bwd_impl<24>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 28: permuto_enc_bwd_impl<28>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 32: permuto_enc_bwd_impl<32>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 36: permuto_enc_bwd_impl<36>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 40: permuto_enc_bwd_impl<40>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 48: permuto_enc_bwd_impl<48>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 56: permuto_enc_bwd_impl<56>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
-		case 64: permuto_enc_bwd_impl<64>(meta, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 2:  permuto_enc_bwd_impl< 2>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 3:  permuto_enc_bwd_impl< 3>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 4:  permuto_enc_bwd_impl< 4>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 5:  permuto_enc_bwd_impl< 5>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 6:  permuto_enc_bwd_impl< 6>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 7:  permuto_enc_bwd_impl< 7>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 8:  permuto_enc_bwd_impl< 8>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 9:  permuto_enc_bwd_impl< 9>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 10: permuto_enc_bwd_impl<10>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 11: permuto_enc_bwd_impl<11>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 12: permuto_enc_bwd_impl<12>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 13: permuto_enc_bwd_impl<13>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 14: permuto_enc_bwd_impl<14>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 15: permuto_enc_bwd_impl<15>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 16: permuto_enc_bwd_impl<16>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 17: permuto_enc_bwd_impl<17>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 18: permuto_enc_bwd_impl<18>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 19: permuto_enc_bwd_impl<19>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 20: permuto_enc_bwd_impl<20>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 24: permuto_enc_bwd_impl<24>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 28: permuto_enc_bwd_impl<28>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 32: permuto_enc_bwd_impl<32>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 36: permuto_enc_bwd_impl<36>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 40: permuto_enc_bwd_impl<40>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 48: permuto_enc_bwd_impl<48>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 56: permuto_enc_bwd_impl<56>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
+		case 64: permuto_enc_bwd_impl<64>(meta, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, max_pos_dims, need_input_grad, need_param_grad, dL_dx, dL_dlattice_val); break;
 		default: throw std::runtime_error(std::string("PermutoEncImpl::fwd: `n_dims_to_encode`=") + std::to_string(meta.n_dims_to_encode) + std::string(" is not yet implemented.")); break;
 	}
 
@@ -400,6 +444,7 @@ std::tuple<at::Tensor, at::Tensor> permuto_enc_bwd_bwd_input(
 	at::Tensor lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_, 
+	at::optional<at::Tensor> level_random_rotations_, 
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	at::optional<uint32_t> batch_data_size_,
@@ -444,6 +489,15 @@ std::tuple<at::Tensor, at::Tensor> permuto_enc_bwd_bwd_input(
 		at::checkSameGPU(__func__, positions_arg, level_random_shifts_arg);
 		at::checkSameType(__func__, positions_arg, level_random_shifts_arg);
 		at::checkContiguous(__func__, level_random_shifts_arg);
+	}
+
+	at::Tensor level_random_rotations;
+	at::TensorArg level_random_rotations_arg(level_random_rotations, "level_random_rotations", 5);
+	if (level_random_rotations_.has_value()) {
+		level_random_rotations = level_random_rotations_.value().to(at::kFloat);
+		at::checkSize(__func__, level_random_rotations_arg, {meta.n_levels, meta.n_dims_to_encode});
+		at::checkSameGPU(__func__, positions_arg, level_random_rotations_arg);
+		at::checkContiguous(__func__, level_random_rotations_arg);
 	}
 
 	at::Tensor batch_inds;
@@ -491,33 +545,33 @@ std::tuple<at::Tensor, at::Tensor> permuto_enc_bwd_bwd_input(
 	}
 
 	switch (meta.n_dims_to_encode) {
-		case  2: permuto_enc_bwd_bwd_input_impl< 2>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case  3: permuto_enc_bwd_bwd_input_impl< 3>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case  4: permuto_enc_bwd_bwd_input_impl< 4>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case  5: permuto_enc_bwd_bwd_input_impl< 5>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case  6: permuto_enc_bwd_bwd_input_impl< 6>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case  7: permuto_enc_bwd_bwd_input_impl< 7>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case  8: permuto_enc_bwd_bwd_input_impl< 8>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case  9: permuto_enc_bwd_bwd_input_impl< 9>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 10: permuto_enc_bwd_bwd_input_impl<10>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 11: permuto_enc_bwd_bwd_input_impl<11>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 12: permuto_enc_bwd_bwd_input_impl<12>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 13: permuto_enc_bwd_bwd_input_impl<13>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 14: permuto_enc_bwd_bwd_input_impl<14>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 15: permuto_enc_bwd_bwd_input_impl<15>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 16: permuto_enc_bwd_bwd_input_impl<16>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 17: permuto_enc_bwd_bwd_input_impl<17>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 18: permuto_enc_bwd_bwd_input_impl<18>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 19: permuto_enc_bwd_bwd_input_impl<19>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 20: permuto_enc_bwd_bwd_input_impl<20>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 24: permuto_enc_bwd_bwd_input_impl<24>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 28: permuto_enc_bwd_bwd_input_impl<28>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 32: permuto_enc_bwd_bwd_input_impl<32>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 36: permuto_enc_bwd_bwd_input_impl<36>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 40: permuto_enc_bwd_bwd_input_impl<40>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 48: permuto_enc_bwd_bwd_input_impl<48>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 56: permuto_enc_bwd_bwd_input_impl<56>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
-		case 64: permuto_enc_bwd_bwd_input_impl<64>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case  2: permuto_enc_bwd_bwd_input_impl< 2>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case  3: permuto_enc_bwd_bwd_input_impl< 3>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case  4: permuto_enc_bwd_bwd_input_impl< 4>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case  5: permuto_enc_bwd_bwd_input_impl< 5>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case  6: permuto_enc_bwd_bwd_input_impl< 6>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case  7: permuto_enc_bwd_bwd_input_impl< 7>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case  8: permuto_enc_bwd_bwd_input_impl< 8>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case  9: permuto_enc_bwd_bwd_input_impl< 9>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 10: permuto_enc_bwd_bwd_input_impl<10>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 11: permuto_enc_bwd_bwd_input_impl<11>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 12: permuto_enc_bwd_bwd_input_impl<12>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 13: permuto_enc_bwd_bwd_input_impl<13>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 14: permuto_enc_bwd_bwd_input_impl<14>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 15: permuto_enc_bwd_bwd_input_impl<15>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 16: permuto_enc_bwd_bwd_input_impl<16>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 17: permuto_enc_bwd_bwd_input_impl<17>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 18: permuto_enc_bwd_bwd_input_impl<18>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 19: permuto_enc_bwd_bwd_input_impl<19>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 20: permuto_enc_bwd_bwd_input_impl<20>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 24: permuto_enc_bwd_bwd_input_impl<24>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 28: permuto_enc_bwd_bwd_input_impl<28>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 32: permuto_enc_bwd_bwd_input_impl<32>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 36: permuto_enc_bwd_bwd_input_impl<36>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 40: permuto_enc_bwd_bwd_input_impl<40>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 48: permuto_enc_bwd_bwd_input_impl<48>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 56: permuto_enc_bwd_bwd_input_impl<56>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
+		case 64: permuto_enc_bwd_bwd_input_impl<64>(meta, dL_ddLdx, dL_dy, positions, lattice_values, level_random_shifts_, level_random_rotations_, batch_inds_, batch_offsets_, batch_data_size, max_level, need_dL_ddLdy, need_dL_dparams, dL_ddLdy, dL_dlattice_val); break;
 		default: throw std::runtime_error(std::string("PermutoEncImpl::fwd: `n_dims_to_encode`=") + std::to_string(meta.n_dims_to_encode) + std::string(" is not yet implemented.")); break;
 	}
 

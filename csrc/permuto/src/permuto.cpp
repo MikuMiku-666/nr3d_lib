@@ -35,6 +35,34 @@ Citation:
 
 #include <permuto/permuto.h>
 
+#include <torch/torch.h>
+#include <torch/extension.h>
+
+// 生成零和子空间的随机旋转矩阵
+torch::Tensor random_rotation_in_zero_sum_subspace_cuda(int dim, int num, torch::Device device, torch::Dtype dtype) {
+    // 创建单位矩阵
+    torch::Tensor I = torch::eye(dim + 1, device=device, dtype=dtype);
+    torch::Tensor ones = torch::ones({dim + 1, 1}, device=device, dtype=dtype);
+    auto Q = torch::linalg::qr(I - torch::matmul(ones, ones.transpose(0, 1)) / (dim + 1)).Q;  // QR分解
+    Q = Q.slice(1, 0, -1); // [dim+1, dim]
+
+    // 生成 num 个随机旋转矩阵
+    torch::Tensor R_sub = torch::randn({num, dim, dim}, device=device, dtype=dtype);  // 随机矩阵
+    for (int i = 0; i < num; ++i) {
+        auto R = torch::linalg::qr(R_sub[i]).Q; // QR 分解确保正交性
+        R_sub[i] = R; // 存储旋转矩阵
+    }
+
+    // 批量旋转矩阵乘法：Q @ R @ Q.T
+    auto Q_T = Q.transpose(0, 1).unsqueeze(0).expand(num, -1, -1); // [num, dim, dim+1]
+    auto Q_exp = Q.unsqueeze(0).expand(num, -1, -1); // [num, dim+1, dim]
+
+    // 执行旋转操作
+    return torch::matmul(Q_exp, torch::matmul(R_sub, Q_T));  // 返回旋转后的矩阵
+}
+
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #define OPTIONAL_ARGS \
 	py::arg("level_random_shifts")=nullptr, \
@@ -73,5 +101,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 		.def_readonly("n_params", &permuto::PermutoEncMeta::n_params)
 
 		;
+		
+	m.def("random_rotation_in_zero_sum_subspace_cuda", &random_rotation_in_zero_sum_subspace_cuda, "Generate random rotations in zero-sum subspace");
+
 	
 }

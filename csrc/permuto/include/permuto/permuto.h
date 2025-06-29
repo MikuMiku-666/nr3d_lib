@@ -105,6 +105,15 @@ struct PermutoEncMeta {
 	uint32_t n_params = 0;                  // Number of total params
 
 	at::Tensor level_scales_multidim;       // [n_levels], each [n_dims_to_encode]:     Grid side lengths for each actual `level`
+	at::Tensor level_random_rotations;
+if (level_random_rotations_.has_value()) {
+    level_random_rotations = level_random_rotations_.value().to(at::kFloat);
+    at::checkSize(__func__, level_random_rotations_arg, {meta.n_levels, meta.n_dims_to_encode});
+    at::checkSameGPU(__func__, positions_arg, level_random_rotations_arg);
+    at::checkSameType(__func__, positions_arg, level_random_rotations_arg);
+    at::checkContiguous(__func__, level_random_rotations_arg);
+}
+
 
 	PermutoEncMeta(
 		const int32_t n_input_dim,
@@ -134,6 +143,7 @@ at::Tensor permuto_enc_fwd(
 	at::Tensor lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_, 
+	at::optional<at::Tensor> level_random_rotations_, 
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	at::optional<uint32_t> batch_data_size_, 
@@ -151,6 +161,7 @@ std::tuple<at::Tensor, at::Tensor> permuto_enc_bwd(
 	at::Tensor lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_, 
+	at::optional<at::Tensor> level_random_rotations_, 
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	at::optional<uint32_t> batch_data_size, 
@@ -169,6 +180,7 @@ std::tuple<at::Tensor, at::Tensor> permuto_enc_bwd_bwd_input(
 	at::Tensor lattice_values, 
 	// Optional
 	at::optional<at::Tensor> level_random_shifts_, 
+	at::optional<at::Tensor> level_random_rotations_, 
 	at::optional<at::Tensor> batch_inds_,
 	at::optional<at::Tensor> batch_offsets_,
 	at::optional<uint32_t> batch_data_size_,
